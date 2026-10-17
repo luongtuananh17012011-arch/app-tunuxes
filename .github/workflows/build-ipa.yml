@@ -1,342 +1,45 @@
-import Foundation
-import NetworkExtension
-import UIKit
-import CryptoKit
+name: Build Unsigned IPA
 
-struct ProxyConfig: Codable, Equatable {
-    var profileName: String
-    var proxyHost: String
-    var proxyPort: Int
-    var proxyType: String
-    var dnsServers: [String]
-    var detectedKeysCount: Int
-    var sha256Short: String
-}
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
 
-@MainActor
-final class ProxyManager: ObservableObject {
-    @Published var config: ProxyConfig?
-    @Published var loadedFileName: String = "Chưa nạp tệp"
-    @Published var loadedFileSize: String = "0 B"
-    @Published var validationState: String = "Chờ chọn tệp từ ứng dụng Tệp"
-    @Published var isFileValid: Bool = false
-    @Published var isProxyActive: Bool = false
-    @Published var isBusy: Bool = false
-    @Published var connectionStatusText: String = "ĐÃ NGẮT KẾT NỐI"
-    @Published var logs: [String] = []
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    @Published var bypassLocalNetwork: Bool = true {
-        didSet { saveSettings(); appendLog("Bypass mạng LAN: \(bypassLocalNetwork ? "BẬT" : "TẮT")") }
-    }
-    @Published var customDNSActive: Bool = true {
-        didSet { saveSettings(); appendLog("DNS tuỳ chỉnh (1.1.1.1): \(customDNSActive ? "BẬT" : "TẮT")") }
-    }
-    @Published var strictVerifyJSON: Bool = false {
-        didSet { saveSettings(); appendLog("Chế độ chỉ nhận JSON chuẩn: \(strictVerifyJSON ? "BẬT" : "TẮT (Nhận mọi file)")") }
-    }
+      - name: Install XcodeGen & Generate Project
+        run: |
+          brew install xcodegen
+          xcodegen generate
 
-    private let storageKey = "tuna_proxy_saved_config_v2"
-    private let settingsKey = "tuna_proxy_toggles_v2"
-    private var statusObserver: NSObjectProtocol?
+      - name: Build Unsigned App
+        run: |
+          PROJECT_NAME=$(ls -d *.xcodeproj | head -n 1)
+          SCHEME_NAME="${PROJECT_NAME%.xcodeproj}"
+          xcodebuild clean build \
+            -project "$PROJECT_NAME" \
+            -scheme "$SCHEME_NAME" \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
 
-    init() {
-        appendLog("Khởi tạo vùng chứa TunaProxy Container...")
-        loadSavedSettings()
-        observeSystemTunnelStatus()
-    }
+      - name: Package into IPA
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          cp -r "$APP_PATH" Payload/
+          zip -r UnsignedApp.ipa Payload
 
-    deinit {
-        if let observer = statusObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-    }
-
-    func appendLog(_ message: String) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        let line = "[\(formatter.string(from: Date()))] \(message)"
-        logs.insert(line, at: 0)
-        if logs.count > 100 {
-            logs.removeLast()
-        }
-    }
-
-    func triggerHaptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle = .medium) {
-        let generator = UIImpactFeedbackGenerator(style: style)
-        generator.prepare()
-        generator.impactOccurred()
-    }
-
-    // MARK: - Nhập mọi loại file từ iPhone Files & lưu vào Container của App
-    func importConfigFile(from url: URL) {
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer {
-            if accessed { url.stopAccessingSecurityScopedResource() }
-        }
-
-        do {
-            let rawData = try Data(contentsOf: url)
-            let fileSize = Int64(rawData.count)
-            loadedFileName = url.lastPathComponent
-            loadedFileSize = ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
-
-            guard fileSize > 0 else {
-                markInvalid(reason: "Tệp rỗng (0 Byte). Vui lòng chọn tệp có dữ liệu.")
-                return
-            }
-
-            // Lưu bản sao của tệp vào thư mục Documents/Container bên trong App để không bị mất
-            let containerDir = try getOrCreateContainerDirectory()
-            let savedFileURL = containerDir.appendingPathComponent(url.lastPathComponent)
-            if FileManager.default.fileExists(atPath: savedFileURL.path) {
-                try FileManager.default.removeItem(at: savedFileURL)
-            }
-            try rawData.write(to: savedFileURL, options: .atomic)
-
-            // Tính mã băm SHA-256 rút gọn để xác nhận file đã nạp thật
-            let digest = SHA256.hash(data: rawData)
-            let hashString = digest.compactMap { String(format: "%02x", $0) }.joined().prefix(12).uppercased()
-
-            // Phân tích linh hoạt nội dung file
-            var host = "127.0.0.1"
-            var port = 8080
-            var type = url.pathExtension.isEmpty ? "RAW" : url.pathExtension.uppercased()
-            var dns = ["1.1.1.1", "1.0.0.1"]
-            var keyCount = 1
-
-            if let jsonObj = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any] {
-                keyCount = jsonObj.count
-                if let h = (jsonObj["proxyHost"] ?? jsonObj["host"] ?? jsonObj["server"] ?? jsonObj["ip"]) as? String, !h.isEmpty {
-                    host = h
-                }
-                if let p = (jsonObj["proxyPort"] ?? jsonObj["port"]) as? Int, (1...65535).contains(p) {
-                    port = p
-                } else if let pStr = (jsonObj["proxyPort"] ?? jsonObj["port"]) as? String, let pInt = Int(pStr), (1...65535).contains(pInt) {
-                    port = pInt
-                }
-                if let t = (jsonObj["proxyType"] ?? jsonObj["type"] ?? jsonObj["protocol"]) as? String, !t.isEmpty {
-                    type = t.uppercased()
-                }
-                if let d = jsonObj["dnsServers"] as? [String], !d.isEmpty {
-                    dns = d
-                }
-            } else if strictVerifyJSON {
-                markInvalid(reason: "Đang bật chế độ bắt buộc JSON chuẩn. Hãy tắt công tắc 'Chỉ nhận JSON chuẩn' để nạp mọi loại file.")
-                return
-            } else if let textContent = String(data: rawData, encoding: .utf8) {
-                // Tự động tìm mẫu IP:Port nếu là file text/.conf/.pac
-                let pattern = #"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})"#
-                if let regex = try? NSRegularExpression(pattern: pattern),
-                   let match = regex.firstMatch(in: textContent, range: NSRange(textContent.startIndex..., in: textContent)),
-                   let hostRange = Range(match.range(at: 1), in: textContent),
-                   let portRange = Range(match.range(at: 2), in: textContent),
-                   let parsedPort = Int(textContent[portRange]), (1...65535).contains(parsedPort) {
-                    host = String(textContent[hostRange])
-                    port = parsedPort
-                }
-                keyCount = max(1, textContent.components(separatedBy: .newlines).filter { !$0.isEmpty }.count)
-            }
-
-            let parsedConfig = ProxyConfig(
-                profileName: url.deletingPathExtension().lastPathComponent,
-                proxyHost: host,
-                proxyPort: port,
-                proxyType: type,
-                dnsServers: dns,
-                detectedKeysCount: keyCount,
-                sha256Short: String(hashString)
-            )
-
-            config = parsedConfig
-            isFileValid = true
-            validationState = "Đã lưu vào Container • SHA: \(hashString)"
-            saveConfigToDisk(parsedConfig)
-            triggerHaptic(.light)
-            appendLog("Đã nạp & lưu '\(loadedFileName)' (\(loadedFileSize)) vào vùng chứa ứng dụng.")
-        } catch {
-            markInvalid(reason: "Không thể đọc tệp: \(error.localizedDescription)")
-        }
-    }
-
-    func loadBuiltInSampleConfig() {
-        let sample = ProxyConfig(
-            profileName: "TUNA Default Proxy",
-            proxyHost: "127.0.0.1",
-            proxyPort: 8080,
-            proxyType: "HTTPS",
-            dnsServers: ["1.1.1.1", "8.8.8.8"],
-            detectedKeysCount: 6,
-            sha256Short: "A1B2C3D4E5F6"
-        )
-        config = sample
-        loadedFileName = "sample-proxy.json"
-        loadedFileSize = "256 B"
-        isFileValid = true
-        validationState = "Hợp lệ • Cấu hình mẫu tích hợp sẵn"
-        saveConfigToDisk(sample)
-        triggerHaptic(.light)
-        appendLog("Đã nạp cấu hình mẫu tích hợp sẵn.")
-    }
-
-    private func getOrCreateContainerDirectory() throws -> URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("ActiveContainer", isDirectory: true)
-        if !FileManager.default.fileExists(atPath: dir.path) {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-        return dir
-    }
-
-    private func markInvalid(reason: String) {
-        isFileValid = false
-        validationState = reason
-        triggerHaptic(.heavy)
-        appendLog("LỖI TỆP: \(reason)")
-    }
-
-    // MARK: - Kích hoạt / Ngắt kích hoạt
-    func toggleProxyActivation() {
-        guard let activeConfig = config, isFileValid else {
-            appendLog("Chưa thể kích hoạt: Vui lòng chọn tệp trước.")
-            return
-        }
-
-        if isProxyActive {
-            stopProxy()
-        } else {
-            startProxy(with: activeConfig)
-        }
-    }
-
-    private func startProxy(with cfg: ProxyConfig) {
-        isBusy = true
-        connectionStatusText = "ĐANG KÍCH HOẠT..."
-        appendLog("Đang kích hoạt tệp [\(loadedFileName)] (\(cfg.proxyHost):\(cfg.proxyPort))...")
-
-        NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, error in
-            Task { @MainActor in
-                guard let self = self else { return }
-
-                if error != nil {
-                    self.activateLocalSandboxContainerMode(with: cfg)
-                    return
-                }
-
-                let manager = managers?.first ?? NETunnelProviderManager()
-                let protocolConfig = NETunnelProviderProtocol()
-                protocolConfig.providerBundleIdentifier = "com.tuna.proxy.app.tunnel"
-                protocolConfig.serverAddress = "\(cfg.proxyHost):\(cfg.proxyPort)"
-                protocolConfig.providerConfiguration = [
-                    "proxyHost": cfg.proxyHost,
-                    "proxyPort": cfg.proxyPort,
-                    "proxyType": cfg.proxyType,
-                    "dnsServers": self.customDNSActive ? cfg.dnsServers : ["1.1.1.1"],
-                    "bypassLocal": self.bypassLocalNetwork
-                ]
-
-                manager.protocolConfiguration = protocolConfig
-                manager.localizedDescription = cfg.profileName
-                manager.isEnabled = true
-
-                manager.saveToPreferences { saveError in
-                    Task { @MainActor in
-                        if saveError != nil {
-                            self.activateLocalSandboxContainerMode(with: cfg)
-                            return
-                        }
-
-                        manager.loadFromPreferences { _ in
-                            Task { @MainActor in
-                                do {
-                                    try manager.connection.startVPNTunnel()
-                                    self.isProxyActive = true
-                                    self.isBusy = false
-                                    self.connectionStatusText = "ĐANG HOẠT ĐỘNG (SYSTEM TUNNEL)"
-                                    self.triggerHaptic(.medium)
-                                    self.appendLog("Đã kích hoạt đường truyền Proxy hệ thống.")
-                                } catch {
-                                    self.activateLocalSandboxContainerMode(with: cfg)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func activateLocalSandboxContainerMode(with cfg: ProxyConfig) {
-        isProxyActive = true
-        isBusy = false
-        connectionStatusText = "ĐÃ KÍCH HOẠT TỆP (CONTAINER ACTIVE)"
-        triggerHaptic(.medium)
-        appendLog("Đã kích hoạt tệp '\(loadedFileName)' (SHA: \(cfg.sha256Short)) trong vùng chứa ứng dụng.")
-    }
-
-    private func stopProxy() {
-        isBusy = true
-        NETunnelProviderManager.loadAllFromPreferences { [weak self] managers, _ in
-            Task { @MainActor in
-                guard let self = self else { return }
-                managers?.first?.connection.stopVPNTunnel()
-                self.isProxyActive = false
-                self.isBusy = false
-                self.connectionStatusText = "ĐÃ NGẮT KẾT NỐI"
-                self.triggerHaptic(.light)
-                self.appendLog("Đã tắt kích hoạt tệp '\(self.loadedFileName)'.")
-            }
-        }
-    }
-
-    private func observeSystemTunnelStatus() {
-        statusObserver = NotificationCenter.default.addObserver(
-            forName: .NEVPNStatusDidChange,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            guard let connection = notification.object as? NEVPNConnection else { return }
-            Task { @MainActor in
-                guard let self = self else { return }
-                if connection.status == .connected {
-                    self.isProxyActive = true
-                    self.connectionStatusText = "ĐANG HOẠT ĐỘNG (SYSTEM TUNNEL)"
-                }
-            }
-        }
-    }
-
-    private func saveConfigToDisk(_ cfg: ProxyConfig) {
-        if let encoded = try? JSONEncoder().encode(cfg) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
-            UserDefaults.standard.set(loadedFileName, forKey: "\(storageKey)_name")
-            UserDefaults.standard.set(loadedFileSize, forKey: "\(storageKey)_size")
-        }
-    }
-
-    private func saveSettings() {
-        let dict: [String: Bool] = [
-            "bypassLocalNetwork": bypassLocalNetwork,
-            "customDNSActive": customDNSActive,
-            "strictVerifyJSON": strictVerifyJSON
-        ]
-        UserDefaults.standard.set(dict, forKey: settingsKey)
-    }
-
-    private func loadSavedSettings() {
-        if let dict = UserDefaults.standard.dictionary(forKey: settingsKey) as? [String: Bool] {
-            bypassLocalNetwork = dict["bypassLocalNetwork"] ?? true
-            customDNSActive = dict["customDNSActive"] ?? true
-            strictVerifyJSON = dict["strictVerifyJSON"] ?? false
-        }
-
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let savedCfg = try? JSONDecoder().decode(ProxyConfig.self, from: data) {
-            config = savedCfg
-            loadedFileName = UserDefaults.standard.string(forKey: "\(storageKey)_name") ?? "saved-file"
-            loadedFileSize = UserDefaults.standard.string(forKey: "\(storageKey)_size") ?? "Đã lưu"
-            isFileValid = true
-            validationState = "Đã lưu trong Container • SHA: \(savedCfg.sha256Short)"
-            appendLog("Đã khôi phục tệp '\(loadedFileName)' từ bộ nhớ ứng dụng.")
-        }
-    }
-}
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPA-File
+          path: UnsignedApp.ipa
